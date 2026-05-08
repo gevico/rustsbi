@@ -115,6 +115,10 @@ pub fn get_work_hart(opaque: usize, nonstandard_a2: usize, boot: bool) -> BootHa
 }
 
 pub fn patch_device_tree(device_tree_ptr: usize) -> usize {
+    if is_k230_device_tree(device_tree_ptr) {
+        return device_tree_ptr;
+    }
+
     use serde_device_tree::buildin::Node;
     use serde_device_tree::ser::serializer::ValueType;
     use serde_device_tree::{Dtb, DtbPtr};
@@ -478,6 +482,8 @@ fn fdt_nop_m_level_aplic(dtb: &mut [u8]) {
             _ => break,
         }
     }
+fn is_k230_device_tree(device_tree_ptr: usize) -> bool {
+    crate::devicetree::is_k230_device_tree(device_tree_ptr)
 }
 
 static mut SBI_START_ADDRESS: usize = 0;

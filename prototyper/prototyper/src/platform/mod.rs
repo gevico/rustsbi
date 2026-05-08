@@ -186,23 +186,61 @@ impl Platform {
     }
 
     pub fn init(&mut self, fdt_address: usize) {
+        if self.try_init_k230(fdt_address) {
+            self.ready.swap(true, Ordering::Release);
+            return;
+        }
+
         let dtb = parse_device_tree(fdt_address).unwrap_or_else(fail::device_tree_format);
         let dtb = dtb.share();
 
         let root: serde_device_tree::buildin::Node = serde_device_tree::from_raw_mut(&dtb)
             .unwrap_or_else(fail::device_tree_deserialize_root);
-        let tree: Tree = root.deserialize();
 
         // Get console device, init sbi console and logger.
         self.sbi_find_and_init_console(&root);
         // Get other info that later platform initialization depends on.
-        self.sbi_misc_init(&tree);
+        self.sbi_misc_init(&root);
         // Get clint and reset device, init sbi ipi, reset, hsm, rfence and susp extension.
         self.sbi_init_ipi_reset_hsm_rfence(&root);
         // Initialize pmu extension
         self.sbi_init_pmu(&root);
 
         self.ready.swap(true, Ordering::Release);
+    }
+
+    fn try_init_k230(&mut self, fdt_address: usize) -> bool {
+        let Some(board) = probe_k230_dtb(fdt_address) else {
+            return false;
+        };
+
+        self.info.memory_range = Some(board.memory_range.unwrap_or(0x0820_0000..0x0fff_f000));
+        self.info.console = Some((
+            board.console_base.unwrap_or(0x9140_0000),
+            MachineConsoleType::Uart16550U32,
+        ));
+        self.info.reset = None;
+        self.info.ipi = Some((
+            board.clint_base.unwrap_or(0xf040_0000),
+            MachineClintType::TheadClint,
+        ));
+        self.info.cpu_num = Some(board.cpu_num.max(1));
+        let mut cpu_enabled = [false; NUM_HART_MAX];
+        for hart in &board.enabled_harts[..board.enabled_hart_count] {
+            if let Some(enabled) = cpu_enabled.get_mut(*hart) {
+                *enabled = true;
+            }
+        }
+        self.info.cpu_enabled = Some(cpu_enabled);
+        self.info.model = "kendryte,k230".to_string();
+
+        self.init_sbi_console_and_logger();
+        self.sbi_ipi_init();
+        self.sbi_hsm_init();
+        self.sbi_reset_init();
+        self.sbi_rfence_init();
+        self.sbi_susp_init();
+        true
     }
 
     fn init_sbi_console_and_logger(&mut self) {
@@ -254,34 +292,31 @@ impl Platform {
     fn sbi_init_ipi_reset_hsm_rfence(&mut self, root: &serde_device_tree::buildin::Node) {
         // Get ipi and reset device info
         let cpu_intc_harts = collect_cpu_intc_harts(root);
-        let mut find_device = |node: &serde_device_tree::buildin::Node| {
-            let info = get_compatible_and_ranges(node);
-            if let Some(info) = info {
-                let (compatible, regs) = info;
-                let base_address = regs[0].start;
-                for device_id in compatible.iter() {
-                    // Initialize clint device.
-                    if SIFIVE_CLINT_COMPATIBLE.contains(&device_id) {
-                        if node.get_prop("clint,has-no-64bit-mmio").is_some() {
-                            self.info.ipi = Some((base_address, MachineClintType::TheadClint));
-                        } else {
-                            self.info.ipi = Some((base_address, MachineClintType::SiFiveClint));
+        for path in ["/soc/clint@f04000000", "/soc/clint@2000000"] {
+            if let Some(node) = root.find(path) {
+                self.init_device_from_node(&node);
+            }
+        }
+        if let Some(node) = root.find("/soc/test@100000") {
+            self.init_device_from_node(&node);
+        }
+        if self.info.ipi.is_none() {
+            let mut find_device = |node: &serde_device_tree::buildin::Node| {
+                self.init_device_from_node(node);
+                let info = get_compatible_and_ranges(node);
+                if let Some(info) = info {
+                    let (compatible, regs) = info;
+                    for device_id in compatible.iter() {
+                        if aia::IMSIC_COMPATIBLE.contains(&device_id)
+                            && self.info.aia.is_none()
+                        {
+                            self.sbi_discover_imsic(node, &regs, &cpu_intc_harts);
                         }
-                    } else if THEAD_CLINT_COMPATIBLE.contains(&device_id) {
-                        self.info.ipi = Some((base_address, MachineClintType::TheadClint));
-                    }
-                    // Initialize reset device.
-                    if SIFIVETEST_COMPATIBLE.contains(&device_id) {
-                        self.info.reset = Some(base_address);
-                    }
-                    // Discover the M-level IMSIC from its CPU interrupt wiring.
-                    if aia::IMSIC_COMPATIBLE.contains(&device_id) && self.info.aia.is_none() {
-                        self.sbi_discover_imsic(node, &regs, &cpu_intc_harts);
                     }
                 }
-            }
-        };
-        root.search(&mut find_device);
+            };
+            root.search(&mut find_device);
+        }
         self.sbi_ipi_init();
         self.sbi_hsm_init();
         self.sbi_reset_init();
@@ -289,20 +324,44 @@ impl Platform {
         self.sbi_susp_init();
     }
 
+    fn init_device_from_node(&mut self, node: &serde_device_tree::buildin::Node) {
+        let Some((compatible, regs)) = get_compatible_and_range(node) else {
+            return;
+        };
+        let base_address = regs.start;
+        for device_id in compatible.iter() {
+            // Initialize clint device.
+            if SIFIVE_CLINT_COMPATIBLE.contains(&device_id) {
+                if node.get_prop("clint,has-no-64bit-mmio").is_some() {
+                    self.info.ipi = Some((base_address, MachineClintType::TheadClint));
+                } else {
+                    self.info.ipi = Some((base_address, MachineClintType::SiFiveClint));
+                }
+            } else if THEAD_CLINT_COMPATIBLE.contains(&device_id) {
+                self.info.ipi = Some((base_address, MachineClintType::TheadClint));
+            }
+            // Initialize reset device.
+            if SIFIVETEST_COMPATIBLE.contains(&device_id) {
+                self.info.reset = Some(base_address);
+            }
+        }
+    }
+
     fn sbi_init_pmu(&mut self, root: &serde_device_tree::buildin::Node) {
         let mut pmu_node: Option<Pmu> = None;
-        let mut find_pmu = |node: &serde_device_tree::buildin::Node| {
-            let info = get_compatible(node);
-            if let Some(compatible_strseq) = info {
-                let compatible_iter = compatible_strseq.iter();
-                for compatible in compatible_iter {
-                    if compatible == "riscv,pmu" {
-                        pmu_node = Some(node.deserialize::<Pmu>());
-                    }
+        for path in ["/pmu", "/soc/pmu"] {
+            let Some(node) = root.find(path) else {
+                continue;
+            };
+            let Some(compatible_strseq) = get_compatible(&node) else {
+                continue;
+            };
+            for compatible in compatible_strseq.iter() {
+                if compatible == "riscv,pmu" {
+                    pmu_node = Some(node.deserialize::<Pmu>());
                 }
             }
-        };
-        root.search(&mut find_pmu);
+        }
 
         if let Some(ref pmu) = pmu_node {
             let sbi_pmu = self.sbi.pmu.get_or_insert_default();
@@ -349,24 +408,31 @@ impl Platform {
         }
     }
 
-    fn sbi_misc_init(&mut self, tree: &Tree) {
+    fn sbi_misc_init(&mut self, root: &serde_device_tree::buildin::Node) {
         // Get memory info
         // TODO: More than one memory node or range?
-        let memory_reg = tree
-            .memory
-            .iter()
-            .next()
-            .unwrap()
-            .deserialize::<Memory>()
-            .reg;
-        let memory_range = memory_reg.iter().next().unwrap().0;
-        self.info.memory_range = Some(memory_range);
+        let mut memory_range = None;
+        for path in ["/memory@0", "/memory@80000000", "/memory"] {
+            let Some(node) = root.find(path) else {
+                continue;
+            };
+            let memory_reg = node.deserialize::<Memory>().reg;
+            memory_range = memory_reg.iter().next().map(|entry| entry.0);
+            if memory_range.is_some() {
+                break;
+            }
+        }
+        self.info.memory_range = memory_range;
 
         // Get cpu number info
-        self.info.cpu_num = Some(tree.cpus.cpu.len());
+        let cpus = root.find("/cpus").map(|node| node.deserialize::<Cpus>());
+        self.info.cpu_num = cpus.as_ref().map(|cpus| cpus.cpu.len());
 
         // Get model info
-        if let Some(ref model) = tree.model {
+        let model = root
+            .get_prop("model")
+            .map(|prop| prop.deserialize::<serde_device_tree::buildin::StrSeq>());
+        if let Some(ref model) = model {
             let model = model.iter().next().unwrap_or("<unspecified>");
             self.info.model = model.to_string();
         } else {
@@ -375,21 +441,25 @@ impl Platform {
         }
 
         // TODO: Need a better extension initialization method
-        extension_detection(&tree.cpus.cpu);
+        if let Some(ref cpus) = cpus {
+            extension_detection(&cpus.cpu);
+        }
 
         // Find which hart is enabled by fdt
         let mut cpu_list: CpuEnableList = [false; NUM_HART_MAX];
-        for cpu_iter in tree.cpus.cpu.iter() {
-            let cpu = cpu_iter.deserialize::<Cpu>();
-            let hart_id = cpu.reg.iter().next().unwrap().0.start;
-            if let Some(x) = cpu_list.get_mut(hart_id) {
-                *x = true;
-            } else {
-                error!(
-                    "The maximum supported hart id is {}, but the hart id {} was obtained. Please check the config!",
-                    NUM_HART_MAX - 1,
-                    hart_id
-                );
+        if let Some(ref cpus) = cpus {
+            for cpu_iter in cpus.cpu.iter() {
+                let cpu = cpu_iter.deserialize::<Cpu>();
+                let hart_id = cpu.reg.iter().next().unwrap().0.start;
+                if let Some(x) = cpu_list.get_mut(hart_id) {
+                    *x = true;
+                } else {
+                    error!(
+                        "The maximum supported hart id is {}, but the hart id {} was obtained. Please check the config!",
+                        NUM_HART_MAX - 1,
+                        hart_id
+                    );
+                }
             }
         }
         self.info.cpu_enabled = Some(cpu_list);
