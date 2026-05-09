@@ -482,6 +482,8 @@ fn fdt_nop_m_level_aplic(dtb: &mut [u8]) {
             _ => break,
         }
     }
+}
+
 fn is_k230_device_tree(device_tree_ptr: usize) -> bool {
     crate::devicetree::is_k230_device_tree(device_tree_ptr)
 }
